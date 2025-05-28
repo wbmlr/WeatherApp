@@ -145,7 +145,8 @@ if st.button("Get Weather", key="get_weather_main_button"):
             # --- Step 2: Log User Query ---
             # start_ts = int(datetime.combine(start_date, datetime.min.time()).timestamp()) if start_date and weather_type == "Historical Weather" else None
             # end_ts = int(datetime.combine(end_date, datetime.min.time()).timestamp()) if end_date and weather_type == "Historical Weather" else None
-            # db_cache.log_user_query(st.session_state.session_id, location_input_value, start_ts, end_ts)
+            db_cache.log_user_query(st.session_state.session_id, location_input_value)
+
 
             # --- Step 3: Fetch Weather Data (Current or Historical) ---
             # if weather_type == "Current Weather":
