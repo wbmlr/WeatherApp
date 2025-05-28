@@ -12,7 +12,6 @@ from streamlit_folium import folium_static
 import pandas as pd
 import altair as alt
 import uuid
-import location_suggestions
 import historical_data_fetch # Import the historical data fetcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
