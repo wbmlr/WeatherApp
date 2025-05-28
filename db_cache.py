@@ -191,15 +191,24 @@ def set_cache(lat, lon, location, data, data_ts):
             """, (lat, lon, location, data_ts, int(time.time()), json.dumps(data)))
         conn.commit()
 
-def log_user_query(session_id, location_string, start_date_ts=None, end_date_ts=None):
-    """Logs a user's weather query."""
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO user_queries (session_id, query_ts, location_string, start_date, end_date)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (session_id, int(time.time()), location_string, start_date_ts, end_date_ts))
+def log_user_query(session_id, location_string, query_ts=None):
+    if query_ts is None:
+        query_ts = int(datetime.now().timestamp())
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_queries (session_id, query_ts, location_string)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE location_string = VALUES(location_string)
+        """, (session_id, query_ts, location_string))
         conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except mysql.connector.Error as err:
+        st.error(f"Error logging user query: {err}")
+        return False
 
 def get_all_user_queries():
     """Retrieves all user queries."""
