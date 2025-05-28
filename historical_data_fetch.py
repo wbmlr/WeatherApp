@@ -102,24 +102,3 @@ def get_historical_weather_in_range_concurrently(lat, lon, start_date_str, end_d
             except Exception as exc:
                 print(f"Future generated an exception: {exc}")
     return results
-
-if __name__ == "__main__":
-    example_lat = 51.5074
-    example_lon = -0.1278
-    # Test with a range that would exceed 240 days to see the limit
-    start_date = "2025-05-20" 
-    end_date = "2025-05-30" 
-
-    print(f"Fetching historical weather for {start_date} to {end_date} concurrently with rate limits...")
-    historical_data_collection = get_historical_weather_in_range_concurrently(
-        example_lat, example_lon, start_date, end_date, API_KEY
-    )
-
-    if historical_data_collection:
-        print(f"\n--- Summary of fetched data ({len(historical_data_collection)} entries) ---")
-        for timestamp, data in sorted(historical_data_collection.items()):
-            date_str = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
-            temp = data['data'][0]['temp'] if data and 'data' in data and data['data'] else 'N/A'
-            print(f"Date: {date_str}, First hour temp: {temp}°C")
-    else:
-        print("No historical data retrieved.")
