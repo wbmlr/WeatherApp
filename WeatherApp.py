@@ -1,7 +1,7 @@
 # WeatherApp.py
 import streamlit as st
 import requests
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, date, timezone # Import date for clarity
 import json
 import db_cache
 import os
@@ -12,13 +12,14 @@ from streamlit_folium import folium_static
 import pandas as pd
 import altair as alt
 import uuid
-import historical_data_fetch
+import location_suggestions
+import historical_data_fetch # Import the historical data fetcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("OPENWEATHER_API_KEY")
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY") # Ensure this is used if needed elsewhere
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
 st.set_page_config(layout="centered", page_title="Weather App")
 st.title("Current Weather & Historical Forecast")
@@ -34,157 +35,14 @@ if 'session_id' not in st.session_state: st.session_state.session_id = str(uuid.
 if 'historical_temps' not in st.session_state: st.session_state.historical_temps = None
 if 'selected_db_table_view' not in st.session_state: st.session_state.selected_db_table_view = None
 if 'city_search_term' not in st.session_state: st.session_state.city_search_term = ""
-if 'weather_type_session' not in st.session_state: st.session_state.weather_type_session = "Current Weather"
-
-
-# NEW: Cached function to fetch and process all weather data
-@st.cache_data(ttl=3600) # Cache for 1 hour
-def _get_weather_data_cached(location_type, location_input_value, manual_lat, manual_lon,
-                             weather_type_selected, start_date_selected, end_date_selected, api_key_val):
-    
-    _weather_data = None
-    _historical_temps = None
-    _location_display = None
-    _error_message = None
-
-    _lat, _lon = manual_lat, manual_lon # Start with potentially pre-filled GPS coords
-
-    try:
-        # --- Step 1: Get Lat/Lon for the location_input_value ---
-        if location_type == "City Name":
-            geo_url = f"http://api.openweathermap.org/data/2.5/weather?q={location_input_value}&appid={api_key_val}"
-            geo_response = requests.get(geo_url).json()
-            if geo_response.get("cod") == 200 and 'coord' in geo_response:
-                _lat = geo_response['coord']['lat']
-                _lon = geo_response['coord']['lon']
-                _location_display = f"Coordinates for '{location_input_value}': Lat={_lat}, Lon={_lon}"
-            else:
-                _error_message = f"Location not found or API error: {geo_response.get('message', 'Unknown error')}"
-                return None, None, None, _error_message
-        elif location_type == "Zip Code":
-            geo_url = f"http://api.openweathermap.org/data/2.5/weather?zip={location_input_value}&appid={api_key_val}"
-            geo_response = requests.get(geo_url).json()
-            if geo_response.get("cod") == 200 and 'coord' in geo_response:
-                _lat = geo_response['coord']['lat']
-                _lon = geo_response['coord']['lon']
-                _location_display = f"Coordinates for '{location_input_value}': Lat={_lat}, Lon={_lon}"
-            else:
-                _error_message = f"Location not found or API error: {geo_response.get('message', 'Unknown error')}"
-                return None, None, None, _error_message
-        elif location_type == "GPS Coordinates":
-            if _lat is None or _lon is None:
-                _error_message = "GPS Coordinates not provided or invalid."
-                return None, None, None, _error_message
-            _location_display = f"Coordinates: Lat={_lat}, Lon={_lon}"
-
-        if _lat is None or _lon is None:
-            _error_message = "Could not determine location coordinates."
-            return None, None, None, _error_message
-
-        # --- Step 2: Log User Query (Called here, so it's logged when data is *initially* fetched/cached)
-        # Note: If the result is served from st.cache_data, this log won't run again for the same query.
-        start_ts_log = int(datetime.combine(start_date_selected, datetime.min.time()).timestamp()) if start_date_selected and weather_type_selected == "Historical Weather" else None
-        end_ts_log = int(datetime.combine(end_date_selected, datetime.min.time()).timestamp()) if end_date_selected and weather_type_selected == "Historical Weather" else None
-        db_cache.log_user_query(st.session_state.session_id, location_input_value, start_ts_log, end_ts_log)
-
-        # --- Step 3: Fetch Weather Data (Current or Historical) ---
-        if weather_type_selected == "Current Weather":
-            cached_data = db_cache.get_cache(_lat, _lon, None, location_input_value)
-            if cached_data:
-                _weather_data = cached_data
-            else:
-                onecall_url = f"https://api.openweathermap.org/data/3.0/onecall?lat={_lat}&lon={_lon}&exclude=minutely,hourly,alerts&appid={api_key_val}&units=metric"
-                fetched_data = requests.get(onecall_url).json()
-                if fetched_data.get("cod") == 200 or "current" in fetched_data:
-                    _weather_data = fetched_data
-                    data_ts = fetched_data['current']['dt'] if 'current' in fetched_data and 'dt' in fetched_data['current'] else int(datetime.now().timestamp())
-                    st.info(f"Data for: {datetime.fromtimestamp(data_ts).strftime('%Y-%m-%d %H:%M:%S')} fetched from API.")
-                    db_cache.set_cache(_lat, _lon, location_input_value, fetched_data, data_ts)
-                else:
-                    _error_message = f"Failed to fetch current weather: {fetched_data.get('message', 'Unknown error')}"
-                    return None, None, None, _error_message
-
-        elif weather_type_selected == "Historical Weather":
-            if not start_date_selected or not end_date_selected:
-                _error_message = "Please select both start and end dates for historical weather."
-                return None, None, None, _error_message
-
-            historical_temps_raw_data = {}
-            
-            start_ts_at_midnight = int(datetime(start_date_selected.year, start_date_selected.month, start_date_selected.day, 0, 0, 0).timestamp())
-            end_ts_at_midnight = int(datetime(end_date_selected.year, end_date_selected.month, end_date_selected.day, 0, 0, 0).timestamp())
-
-            cached_data_for_range = db_cache.get_cache_for_range(_lat, _lon, start_ts_at_midnight, end_ts_at_midnight)
-            for ts, data in cached_data_for_range.items():
-                historical_temps_raw_data[ts] = data
-
-            missing_api_timestamps = []
-            current_day_iter = start_date_selected
-            while current_day_iter <= end_date_selected:
-                daily_timestamp_for_db_key = int(datetime(current_day_iter.year, current_day_iter.month, current_day_iter.day, 0, 0, 0).timestamp())
-                
-                if daily_timestamp_for_db_key not in historical_temps_raw_data:
-                    # Append noon UTC timestamp for API call
-                    missing_api_timestamps.append(int(datetime(current_day_iter.year, current_day_iter.month, current_day_iter.day, 12, 0, 0, tzinfo=timezone.utc).timestamp()))
-                current_day_iter += timedelta(days=1)
-            
-            if missing_api_timestamps:
-                api_fetched_data = historical_data_fetch.get_historical_weather_for_specific_timestamps_concurrently(
-                    _lat, _lon, missing_api_timestamps, api_key_val
-                )
-                
-                for timestamp_noon_utc, data in api_fetched_data.items():
-                    api_date = datetime.fromtimestamp(timestamp_noon_utc, tz=timezone.utc).date()
-                    db_key_timestamp = int(datetime(api_date.year, api_date.month, api_date.day, 0, 0, 0).timestamp())
-                    
-                    if db_key_timestamp not in historical_temps_raw_data: # Ensure we don't overwrite existing cache
-                        historical_temps_raw_data[db_key_timestamp] = data
-                        db_cache.set_cache(_lat, _lon, location_input_value, data, db_key_timestamp)
-
-                fetched_timestamps_str = ", ".join([datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') for ts in api_fetched_data.keys()])
-                if fetched_timestamps_str:
-                    st.info(f"Data for: {fetched_timestamps_str} fetched from API.")
-                else:
-                    st.info('All Data from DataBase.')
-
-            historical_temps_list = []
-            current_day_iter_final = start_date_selected
-            while current_day_iter_final <= end_date_selected:
-                daily_timestamp_for_db_key = int(datetime(current_day_iter_final.year, current_day_iter_final.month, current_day_iter_final.day, 0, 0, 0).timestamp())
-                
-                day_data = historical_temps_raw_data.get(daily_timestamp_for_db_key)
-
-                if day_data and 'data' in day_data and len(day_data['data']) > 0:
-                    temps_for_day = [hour['temp'] for hour in day_data['data'] if 'temp' in hour]
-                    avg_temp = sum(temps_for_day) / len(temps_for_day) if temps_for_day else None
-                    
-                    if avg_temp is not None:
-                        historical_temps_list.append({
-                            "Date": current_day_iter_final,
-                            "Average Temperature (°C)": round(avg_temp, 1)
-                        })
-                current_day_iter_final += timedelta(days=1)
-            
-            if historical_temps_list:
-                _historical_temps = pd.DataFrame(sorted(historical_temps_list, key=lambda x: x['Date']))
-            else:
-                _error_message = "No historical temperature data could be retrieved for the selected range."
-
-    except requests.exceptions.RequestException as e:
-        _error_message = f"Network error during weather fetch: {e}"
-    except Exception as e:
-        _error_message = f"An unexpected error occurred during weather fetch: {e}"
-
-    return _weather_data, _historical_temps, _location_display, _error_message
-
 
 location_type = st.radio("Select input type:", ("City Name", "Zip Code", "GPS Coordinates"))
-st.session_state.weather_type_session = st.radio("Select weather type:", ("Current Weather", "Historical Weather")) # Use session state for weather_type
+weather_type = st.radio("Select weather type:", ("Current Weather", "Historical Weather"))
 
 location_input_value = ""
 lat, lon = None, None
 
-# --- Location Input Logic ---
+# --- Location Input Logic (unchanged) ---
 if location_type == "GPS Coordinates":
     geolocation_data = streamlit_geolocation()
     if geolocation_data and geolocation_data.get('latitude') and geolocation_data.get('longitude'):
@@ -205,25 +63,13 @@ if location_type == "GPS Coordinates":
             folium.Marker([lat, lon]).add_to(m)
             folium_static(m)
     else:
-        # Use session state for manual GPS input to persist across reruns
-        manual_gps_input_key = "manual_gps_input"
-        if 'manual_gps_val' not in st.session_state:
-            st.session_state.manual_gps_val = ""
-        
-        st.session_state.manual_gps_val = st.text_input("Enter coordinates (Lat, Lon)", value=st.session_state.manual_gps_val, key=manual_gps_input_key)
-        
-        if st.session_state.manual_gps_val:
+        location_input_value = st.text_input("Enter coordinates (Lat, Lon)", key="manual_gps_input")
+        if location_input_value:
             try:
-                lat_str, lon_str = map(str.strip, st.session_state.manual_gps_val.split(','))
-                lat = st.session_state.current_lat = float(lat_str)
-                lon = st.session_state.current_lon = float(lon_str)
-                location_input_value = st.session_state.manual_gps_val
+                st.session_state.current_lat, st.session_state.current_lon = map(float, location_input_value.split(','))
             except ValueError:
                 st.error("Invalid coordinate format. Use 'Lat,Lon'.")
-                # Do not st.stop() here, allow the rest of the app to render.
-        else:
-            st.session_state.current_lat = None
-            st.session_state.current_lon = None
+                st.stop()
 else:
     filtered_country_names = [name for name in COUNTRIES.keys()]
     selected_country_name = st.selectbox("Select Country", filtered_country_names, key="country_select")
@@ -238,66 +84,206 @@ else:
             if city_name: location_input_value = f"{city_name},{selected_country_code}"
     else: st.info("Please select a country.")
 
-# --- Date Range Input for Historical Weather ---
+# --- Date Range Input for Historical Weather (unchanged) ---
 start_date, end_date = None, None
-if st.session_state.weather_type_session == "Historical Weather":
+if weather_type == "Historical Weather":
     st.subheader("Select Date Range")
     today = datetime.now().date()
-    max_future_date = today + timedelta(days=500)
-    default_future_date = today + timedelta(days=10)
-
     max_past_date = today - timedelta(days=5000)
-    default_past_date = today - timedelta(days=10)
+    default_past_data = today - timedelta(days=10)
     
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("Start Date", max_value=today, min_value=max_past_date, value=default_past_date)
+        start_date = st.date_input("Start Date", max_value=today, min_value=max_past_date, value=default_past_data)
     with col2:
-        end_date = st.date_input("End Date", max_value=max_future_date, min_value=start_date, value=default_future_date)
+        end_date = st.date_input("End Date", max_value=today, min_value=start_date, value=today)
 
-
-# Use a unique key for the button to prevent issues with re-runs if other inputs change
 if st.button("Get Weather", key="get_weather_main_button"):
     st.session_state.weather_data = None
     st.session_state.location_display = None
     st.session_state.historical_temps = None
-    st.session_state.selected_db_table_view = None # Clear this specific view
+    st.session_state.selected_db_table_view = None
 
-    if not location_input_value and location_type != "GPS Coordinates": # GPS coordinates can be derived from lat/lon directly
+    if not location_input_value:
         st.warning("Please enter a valid location or select required options.")
-        st.stop()
-    if location_type == "GPS Coordinates" and (lat is None or lon is None):
-        st.warning("Please provide valid GPS coordinates.")
         st.stop()
     if not API_KEY or API_KEY == "YOUR_DEFAULT_API_KEY_HERE_OR_READ_FROM_ENV":
         st.error("Please provide a valid OpenWeatherMap API key.")
         st.stop()
-    if st.session_state.weather_type_session == "Historical Weather" and (start_date is None or end_date is None):
-        st.warning("Please select both start and end dates for historical weather.")
-        st.stop()
 
     with st.spinner("Fetching location and weather data..."):
-        # Call the cached function
-        fetched_weather_data, fetched_historical_temps, fetched_location_display, error_msg = \
-            _get_weather_data_cached(location_type, location_input_value, lat, lon,
-                                     st.session_state.weather_type_session, start_date, end_date, API_KEY)
-        
-        if error_msg:
-            st.error(error_msg)
-            # Clear session state if there was an error to prevent displaying stale data
-            st.session_state.weather_data = None
-            st.session_state.historical_temps = None
-            st.session_state.location_display = None
-        else:
-            st.session_state.weather_data = fetched_weather_data
-            st.session_state.historical_temps = fetched_historical_temps
-            st.session_state.location_display = fetched_location_display
+        try:
+            # --- Step 1: Get Lat/Lon for the location_input_value ---
+            geo_response = None
+            if location_type == "City Name":
+                geo_url = f"http://api.openweathermap.org/data/2.5/weather?q={location_input_value}&appid={API_KEY}"
+            elif location_type == "Zip Code":
+                geo_url = f"http://api.openweathermap.org/data/2.5/weather?zip={location_input_value}&appid={API_KEY}"
+            elif location_type == "GPS Coordinates":
+                try:
+                    lat_str, lon_str = map(str.strip, location_input_value.split(','))
+                    lat = float(lat_str)
+                    lon = float(lon_str)
+                    st.session_state.location_display = f"Coordinates: Lat={lat}, Lon={lon}"
+                    geo_response = {"cod": 200, "coord": {"lat": lat, "lon": lon}}
+                except ValueError:
+                    st.error("For GPS Coordinates, invalid format. Please use 'Lat,Lon'.")
+                    st.stop()
+            
+            if geo_response is None:
+                geo_response = requests.get(geo_url).json()
+
+            if geo_response.get("cod") == 200 and 'coord' in geo_response:
+                lat = geo_response['coord']['lat']
+                lon = geo_response['coord']['lon']
+                if location_type != "GPS Coordinates":
+                    st.session_state.location_display = f"Coordinates for '{location_input_value}': Lat={lat}, Lon={lon}"
+            else:
+                st.error(f"Location not found or API error: {geo_response.get('message', 'Unknown error')}")
+                st.stop()
+
+            # --- Step 2: Log User Query ---
+            start_ts = int(datetime.combine(start_date, datetime.min.time()).timestamp()) if start_date and weather_type == "Historical Weather" else None
+            end_ts = int(datetime.combine(end_date, datetime.min.time()).timestamp()) if end_date and weather_type == "Historical Weather" else None
+            db_cache.log_user_query(st.session_state.session_id, location_input_value, start_ts, end_ts)
+
+            # --- Step 3: Fetch Weather Data (Current or Historical) ---
+            if weather_type == "Current Weather":
+                cached_data = db_cache.get_cache(lat, lon, None, location_input_value)
+                if cached_data:
+                    st.info("Current weather data from cache...")
+                    st.session_state.weather_data = cached_data
+                else:
+                    onecall_url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}&exclude=minutely,hourly,alerts&appid={API_KEY}&units=metric"
+                    fetched_data = requests.get(onecall_url).json()
+                    if fetched_data.get("cod") == 200 or "current" in fetched_data:
+                        st.session_state.weather_data = fetched_data
+                        data_ts = fetched_data['current']['dt'] if 'current' in fetched_data and 'dt' in fetched_data['current'] else int(datetime.now().timestamp())
+                        db_cache.set_cache(lat, lon, location_input_value, fetched_data, data_ts)
+                    else:
+                        st.error(f"Failed to fetch current weather: {fetched_data.get('message', 'Unknown error')}")
+
+            elif weather_type == "Historical Weather":
+                if not start_date or not end_date:
+                    st.error("Please select both start and end dates for historical weather.")
+                    st.stop()
+
+                historical_temps_raw_data = {} # To store all raw data, keyed by daily timestamp
+                
+                # Convert date objects to timestamps for database query
+                start_ts_at_midnight = int(datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0).timestamp())
+                end_ts_at_midnight = int(datetime(end_date.year, end_date.month, end_date.day, 0, 0, 0).timestamp())
+
+                # 1. Fetch all available data from the database for the entire range
+                st.info("Attempting to retrieve historical data from cache for the selected range...")
+                cached_data_for_range = db_cache.get_cache_for_range(lat, lon, start_ts_at_midnight, end_ts_at_midnight)
+                
+                # Populate raw data with cached entries
+                for ts, data in cached_data_for_range.items():
+                    historical_temps_raw_data[ts] = data
+                    st.write(f"Cached data found for {datetime.fromtimestamp(ts).date()}") # For debugging
+
+                # 2. Identify missing days and prepare for API fetch
+                missing_dates = []
+                current_day_iter = start_date
+                while current_day_iter <= end_date:
+                    daily_timestamp_for_api = int(datetime(current_day_iter.year, current_day_iter.month, current_day_iter.day, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+                    daily_timestamp_for_db_key = int(datetime(current_day_iter.year, current_day_iter.month, current_day_iter.day, 0, 0, 0).timestamp())
+
+                    if daily_timestamp_for_db_key not in historical_temps_raw_data:
+                        missing_dates.append(current_day_iter.strftime('%Y-%m-%d'))
+                    current_day_iter += timedelta(days=1)
+                
+                api_fetched_data = {}
+                if missing_dates:
+                    st.subheader(f"Fetching {len(missing_dates)} missing day(s) from API (up to 240 calls total, 60/min limit)...")
+                    # To use the concurrent fetcher, we pass the range it expects.
+                    # It will internally re-calculate timestamps and use the rate limiter.
+                    # We need to ensure we only get data for the *missing* days.
+                    # The historical_data_fetch function currently fetches for a *range*.
+                    # This means it might refetch data already in cache.
+                    # To avoid this, historical_data_fetch would need to accept a list of specific timestamps.
+                    # For now, we'll run it for the *full range* again, and update our `historical_temps_raw_data`
+                    # only with truly new entries, relying on `historical_temps_raw_data` for de-duplication.
+
+                    # To optimize, modify historical_data_fetch.py to accept a list of specific timestamps:
+                    # historical_data_fetch.get_historical_weather_for_specific_timestamps(lat, lon, timestamps_to_fetch_from_api, API_KEY)
+                    
+                    # Given the current structure, we need to pass the start/end date for the API fetcher,
+                    # and then carefully merge.
+                    
+                    # *Self-correction*: The best way to use the existing `get_historical_weather_in_range_concurrently`
+                    # is to tell it to only fetch data for the exact range of missing days, if possible.
+                    # However, since `get_historical_weather_in_range_concurrently` takes `start_date_str` and `end_date_str`,
+                    # and iterates day by day, we cannot directly give it a sparse list of `missing_dates`.
+
+                    # Option 1 (Less efficient, current `historical_data_fetch` structure):
+                    # Fetch for the entire range, and filter what's new.
+                    st.info(f'start_data: {type(start_date)}, end_date: {end_date}')
+                    @st.cache_data(ttl=3600) # Cache for 1 hour
+                    def cached_historical_fetch(lat, lon, start_date_str, end_date_str, api_key):
+                        return historical_data_fetch.get_historical_weather_in_range_concurrently(lat, lon, start_date_str, end_date_str, api_key)
+
+                    api_fetched_data = api_fetched_data = cached_historical_fetch(
+                        lat, lon, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), API_KEY
+                    )
+                    st.info(f"API fetched {len(api_fetched_data)} days (may include cached days if API returned them).")
+                    
+                    for timestamp_unix, data in api_fetched_data.items():
+                        # The API timestamps are for noon. We need to map them to midnight for DB key.
+                        api_date = datetime.fromtimestamp(timestamp_unix, tz=timezone.utc).date()
+                        db_key_timestamp = int(datetime(api_date.year, api_date.month, api_date.day, 0, 0, 0).timestamp())
+
+                        if db_key_timestamp not in historical_temps_raw_data:
+                            historical_temps_raw_data[db_key_timestamp] = data
+                            db_cache.set_cache(lat, lon, location_input_value, data, db_key_timestamp)
+                            st.write(f"New data fetched from API and cached for {api_date}") # For debugging
+                        else: # For debugging
+                            st.write(f"Skipping API data for {api_date} as it was already in cache.")
+
+                elif not missing_dates:
+                    st.info("All historical data for the selected range found in cache.")
+
+                # 3. Process all raw data (cached + API) into display format
+                historical_temps_list = []
+                current_day_iter_final = start_date
+                while current_day_iter_final <= end_date:
+                    daily_timestamp_for_db_key = int(datetime(current_day_iter_final.year, current_day_iter_final.month, current_day_iter_final.day, 0, 0, 0).timestamp())
+                    
+                    day_data = historical_temps_raw_data.get(daily_timestamp_for_db_key)
+
+                    if day_data and 'data' in day_data and len(day_data['data']) > 0:
+                        temps_for_day = [hour['temp'] for hour in day_data['data'] if 'temp' in hour]
+                        avg_temp = sum(temps_for_day) / len(temps_for_day) if temps_for_day else None
+                        
+                        if avg_temp is not None:
+                            historical_temps_list.append({
+                                "Date": current_day_iter_final,
+                                "Average Temperature (°C)": round(avg_temp, 1)
+                            })
+                        else:
+                            st.warning(f"No temperature data found in raw data for {current_day_iter_final}.")
+                    else:
+                        st.warning(f"No valid data (cached or API) found for {current_day_iter_final}. Skipping.")
+                    current_day_iter_final += timedelta(days=1)
+                
+                if historical_temps_list:
+                    # Ensure sorted by date before creating DataFrame
+                    historical_temps_list_sorted = sorted(historical_temps_list, key=lambda x: x['Date'])
+                    st.session_state.historical_temps = pd.DataFrame(historical_temps_list_sorted)
+                else:
+                    st.warning("No historical temperature data could be retrieved for the selected range.")
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error: {e}")
+        except Exception as e:
+            st.exception(f"An unexpected error occurred: {e}") # Use st.exception for full traceback
 
 # --- Display Fetched Data (unchanged) ---
 if st.session_state.location_display:
     st.success(st.session_state.location_display)
 
-if st.session_state.weather_type_session == "Current Weather" and st.session_state.weather_data:
+if weather_type == "Current Weather" and st.session_state.weather_data:
     st.header("Current Weather")
     if 'current' in st.session_state.weather_data:
         current_data = st.session_state.weather_data['current']
@@ -344,7 +330,7 @@ if st.session_state.weather_type_session == "Current Weather" and st.session_sta
         st.table(forecast_table)
     else: st.warning("Daily forecast data not available or malformed.")
 
-elif st.session_state.weather_type_session == "Historical Weather" and st.session_state.historical_temps is not None:
+elif weather_type == "Historical Weather" and st.session_state.historical_temps is not None:
     st.header("Historical Temperature Trend")
     st.dataframe(st.session_state.historical_temps)
 
@@ -357,11 +343,11 @@ elif st.session_state.weather_type_session == "Historical Weather" and st.sessio
     ).interactive()
 
     st.altair_chart(chart, use_container_width=True)
-elif st.session_state.weather_type_session == "Historical Weather" and st.session_state.historical_temps is None:
+elif weather_type == "Historical Weather" and st.session_state.historical_temps is None:
     st.info("No historical data to display. Please fetch data first.")
 
 
-# # --- View Past Queries Section (unchanged in functionality, adjusted for session state) ---
+# # --- View Past Queries Section (unchanged) ---
 # st.markdown("---")
 # st.header("View Past Queries")
 
@@ -376,8 +362,7 @@ elif st.session_state.weather_type_session == "Historical Weather" and st.sessio
         
 #         selected_query_index = st.selectbox("Select a past query to view:", range(len(query_options)), format_func=lambda x: query_options[x], key="past_query_select")
 
-#         if selected_query_index is not None and st.button("Load Selected Query", key="load_selected_query_button"):
-#             # Everything from original Line 352 to 386 moves here
+#         if selected_query_index is not None:
 #             selected_query = all_queries_sorted[selected_query_index]
 #             location_str = selected_query['location_string']
 #             query_start_ts = selected_query['start_date']
@@ -388,11 +373,9 @@ elif st.session_state.weather_type_session == "Historical Weather" and st.sessio
 #             st.session_state.weather_data = None
 #             st.session_state.historical_temps = None
 #             st.session_state.location_display = None
-            
-#             derived_location_type = "City Name"
+
 #             query_lat, query_lon = None, None
 #             if "Lat=" in location_str and "Lon=" in location_str:
-#                 derived_location_type = "GPS Coordinates"
 #                 try:
 #                     parts = location_str.split(': ')[1].split(', ')
 #                     query_lat = float(parts[0].replace('Lat=', ''))
@@ -400,22 +383,52 @@ elif st.session_state.weather_type_session == "Historical Weather" and st.sessio
 #                 except (IndexError, ValueError):
 #                     st.warning("Could not parse Lat/Lon from saved GPS string. Attempting lookup by location name.")
 
-#             query_start_date_obj = datetime.fromtimestamp(query_start_ts).date() if query_start_ts else None
-#             query_end_date_obj = datetime.fromtimestamp(query_end_ts).date() if query_end_ts else None
+#             if query_start_ts and query_end_ts: # This was a historical query
+#                 st.session_state.location_display = f"Historical data for '{location_str}' (Cached)"
+#                 historical_temps_list_from_cache = []
+#                 current_day_from_query = datetime.fromtimestamp(query_start_ts).date()
+#                 end_day_from_query = datetime.fromtimestamp(query_end_ts).date()
 
-#             derived_weather_type = "Historical Weather" if query_start_ts else "Current Weather"
-#             st.session_state.weather_type_session = derived_weather_type
-
-#             fetched_weather_data, fetched_historical_temps, fetched_location_display, error_msg = \
-#                 _get_weather_data_cached(derived_location_type, location_str, query_lat, query_lon,
-#                                         derived_weather_type, query_start_date_obj, query_end_date_obj, API_KEY)
-            
-#             if error_msg:
-#                 st.error(f"Error retrieving past query data: {error_msg}")
-#             else:
-#                 st.session_state.weather_data = fetched_weather_data
-#                 st.session_state.historical_temps = fetched_historical_temps
-#                 st.session_state.location_display = fetched_location_display
+#                 while current_day_from_query <= end_day_from_query:
+#                     daily_timestamp = int(datetime(current_day_from_query.year, current_day_from_query.month, current_day_from_query.day, 0, 0, 0).timestamp())
+                    
+#                     daily_cached_data = db_cache.get_cache(
+#                         lat=query_lat if query_lat is not None else None,
+#                         lon=query_lon if query_lon is not None else None,
+#                         target_data_ts=daily_timestamp,
+#                         location=location_str
+#                     )
+                    
+#                     if daily_cached_data and 'data' in daily_cached_data and len(daily_cached_data['data']) > 0:
+#                         temps_for_day = [hour['temp'] for hour in daily_cached_data['data'] if 'temp' in hour]
+#                         avg_temp = sum(temps_for_day) / len(temps_for_day) if temps_for_day else None
+#                         if avg_temp is not None:
+#                             historical_temps_list_from_cache.append({
+#                                 "Date": current_day_from_query,
+#                                 "Average Temperature (°C)": round(avg_temp, 1)
+#                             })
+#                     else:
+#                         st.warning(f"Historical data for {current_day_from_query} not found in cache for {location_str}.")
+#                     current_day_from_query += timedelta(days=1)
+                
+#                 if historical_temps_list_from_cache:
+#                     st.session_state.historical_temps = pd.DataFrame(historical_temps_list_from_cache)
+#                     st.session_state.weather_type = "Historical Weather"
+#                 else:
+#                     st.warning("No historical data found in cache for this query range.")
+#             else: # This was a current weather query
+#                 st.session_state.location_display = f"Current data for '{location_str}' (Cached)"
+#                 data_to_display = db_cache.get_cache(
+#                     lat=query_lat if query_lat is not None else None,
+#                     lon=query_lon if query_lon is not None else None,
+#                     target_data_ts=None,
+#                     location=location_str
+#                 )
+#                 if data_to_display:
+#                     st.session_state.weather_data = data_to_display
+#                     st.session_state.weather_type = "Current Weather"
+#                 else:
+#                     st.warning("Current weather data not found in cache for this query.")
             
 #             st.rerun()
 #     else:
@@ -439,8 +452,7 @@ with st.expander("Browse and Edit Database Data"):
     if not db_tables:
         st.warning("No database tables found.")
     else:
-        # Initialize selected_db_table_view if it's not set or invalid
-        if 'selected_db_table_view' not in st.session_state or st.session_state.selected_db_table_view not in db_tables:
+        if st.session_state.selected_db_table_view not in db_tables:
             st.session_state.selected_db_table_view = db_tables[0] if db_tables else None
 
         st.session_state.selected_db_table_view = st.selectbox(
@@ -531,9 +543,6 @@ with st.expander("Browse and Edit Database Data"):
                                     final_new_value = json.loads(new_value_input)
                                 db_cache.update_record(selected_db_table, typed_pk_values, field_to_edit, final_new_value)
                                 st.success(f"Record updated successfully in '{selected_db_table}'. Refreshing data...")
-                                # Invalidate cache if weather_cache is updated directly
-                                if selected_db_table == 'weather_cache':
-                                    _get_weather_data_cached.clear() # Clear the cache for fresh data
                                 st.rerun()
                             except ValueError as ve:
                                 st.error(f"Data type error: {ve}. Please ensure values match expected types (e.g., numbers, integers, valid JSON for 'data').")
@@ -568,11 +577,9 @@ with st.expander("Browse and Edit Database Data"):
 
                         db_cache.delete_record(selected_db_table, typed_delete_pk_values)
                         st.success(f"Record deleted successfully from '{selected_db_table}'. Refreshing data...")
-                        # Invalidate cache if weather_cache is deleted from
-                        if selected_db_table == 'weather_cache':
-                            _get_weather_data_cached.clear() # Clear the cache for fresh data
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error deleting record: {e}")
+
             else:
                 st.info("No data found in this table.")
