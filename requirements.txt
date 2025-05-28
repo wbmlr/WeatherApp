@@ -1,0 +1,9 @@
+streamlit
+requests
+streamlit-geolocation
+folium
+streamlit-folium
+pandas
+altair
+python-dotenv
+pymysql
