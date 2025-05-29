@@ -1,0 +1,26 @@
+# .choreo/component.yaml
+name: weather-app
+project: your-choreo-project-name # Replace with your Choreo project name
+componentType: service
+build:
+  pack: python # Assuming Python buildpack
+  command: "streamlit"
+  args:
+    - "run"
+    - "WeatherApp.py"
+    - "--server.port"
+    - "$PORT" # Choreo provides PORT env var
+    - "--server.address"
+    - "0.0.0.0"
+endpoints:
+  - port: 8501 # Default Streamlit port, Choreo maps $PORT to this
+    type: WEB
+    name: streamlit-ui
+    context: /
+environmentVariables:
+  - name: OPENWEATHER_API_KEY
+    value: "YOUR_OPENWEATHER_API_KEY" # Replace or use Choreo secrets
+  # - name: GOOGLE_PLACES_API_KEY
+  #   value: "YOUR_GOOGLE_PLACES_API_KEY" # Replace or use Choreo secrets
+  # Add database connection environment variables here if needed
+  # e.g., DB_HOST, DB_USER, DB_PASSWORD, DB_NAME
